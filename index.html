@@ -656,10 +656,212 @@
 (function(){
   "use strict";
   var CACHE_KEY = "pincha-tracker-cache-v1";
-  var API_URL = "/api/estudiantes";
   var countdownTimer = null;
 
   var LEAGUE_LABELS = { liga: "Liga Profesional", argentina: "Copa Argentina", libertadores: "Copa Libertadores" };
+
+  // --- Live data straight from ESPN's public (unofficial) JSON API -------
+  // This runs in the visitor's own phone/browser, not on a server, so each
+  // request comes from their own home/mobile connection. (We tried doing
+  // this from a Netlify server function first, but ESPN blocks that shared
+  // server network with a 403 — the browser has no such problem.)
+  var TEAM_ID = "8"; // Estudiantes de La Plata, ESPN team id
+  var LEAGUES = [
+    { key: "liga", name: "Liga Profesional", slug: "arg.1", hasTable: true },
+    { key: "argentina", name: "Copa Argentina", slug: "arg.copa", hasTable: false },
+    { key: "libertadores", name: "Copa Libertadores", slug: "conmebol.libertadores", hasTable: false }
+  ];
+  var STANDINGS_LEAGUE_SLUG = "arg.1";
+
+  function scheduleUrl(slug){
+    return "https://site.api.espn.com/apis/site/v2/sports/soccer/" + slug + "/teams/" + TEAM_ID + "/schedule";
+  }
+  function standingsUrl(slug){
+    return "https://site.api.espn.com/apis/v2/sports/soccer/" + slug + "/standings";
+  }
+
+  function fetchEspnJson(url){
+    return fetch(url, { mode: "cors", cache: "no-store" }).then(function(res){
+      if (!res.ok) throw new Error("HTTP " + res.status + " for " + url);
+      return res.json();
+    });
+  }
+
+  function getStat(entry, aliases){
+    var stats = entry && entry.stats;
+    if (!Array.isArray(stats)) return null;
+    var wanted = aliases.map(function(a){ return a.toLowerCase(); });
+    for (var i = 0; i < stats.length; i++){
+      var s = stats[i];
+      var candidates = [s.name, s.abbreviation, s.shortDisplayName, s.displayName]
+        .filter(Boolean)
+        .map(function(x){ return String(x).toLowerCase(); });
+      var match = candidates.some(function(c){ return wanted.indexOf(c) !== -1; });
+      if (match){
+        var v = s.value != null ? s.value : s.displayValue;
+        var n = Number(v);
+        return isFinite(n) && v !== "" && v != null ? n : v;
+      }
+    }
+    return null;
+  }
+
+  function parseEvent(event, leagueMeta){
+    var competition = event.competitions && event.competitions[0];
+    if (!competition) return null;
+    var competitors = competition.competitors || [];
+    var us = competitors.filter(function(c){ return String(c.team && c.team.id) === TEAM_ID; })[0];
+    var them = competitors.filter(function(c){ return String(c.team && c.team.id) !== TEAM_ID; })[0];
+    if (!us || !them) return null;
+
+    var completed = !!(competition.status && competition.status.type && competition.status.type.completed);
+    var dateISO = event.date;
+    var isHome = competition.competitors.filter(function(c){ return c.homeAway === "home"; })[0] === us;
+
+    var roundLabel = null;
+    var note = competition.notes && competition.notes[0] && competition.notes[0].headline;
+    if (note) roundLabel = note;
+
+    return {
+      id: event.id,
+      league: leagueMeta.key,
+      leagueName: leagueMeta.name,
+      dateISO: dateISO,
+      completed: completed,
+      isHome: isHome,
+      opponent: (them.team && (them.team.displayName || them.team.name)) || "Rival",
+      venue: (competition.venue && competition.venue.fullName) || null,
+      roundLabel: roundLabel,
+      scoreFor: us.score != null ? Number(us.score.value != null ? us.score.value : us.score) : null,
+      scoreAgainst: them.score != null ? Number(them.score.value != null ? them.score.value : them.score) : null
+    };
+  }
+
+  function loadLeague(leagueMeta){
+    return fetchEspnJson(scheduleUrl(leagueMeta.slug)).then(function(data){
+      var events = Array.isArray(data.events) ? data.events : [];
+      var parsed = events.map(function(e){ return parseEvent(e, leagueMeta); }).filter(Boolean);
+      parsed.sort(function(a, b){ return new Date(a.dateISO) - new Date(b.dateISO); });
+      var completed = parsed.filter(function(e){ return e.completed; });
+      var upcoming = parsed.filter(function(e){ return !e.completed; });
+      return { completed: completed, upcoming: upcoming };
+    });
+  }
+
+  function loadStandings(){
+    return fetchEspnJson(standingsUrl(STANDINGS_LEAGUE_SLUG)).then(function(data){
+      var groups = Array.isArray(data.children) ? data.children : [];
+      for (var g = 0; g < groups.length; g++){
+        var group = groups[g];
+        var entries = (group.standings && group.standings.entries) || [];
+        var idx = -1;
+        for (var i = 0; i < entries.length; i++){
+          if (String(entries[i].team && entries[i].team.id) === TEAM_ID){ idx = i; break; }
+        }
+        if (idx !== -1){
+          var mapped = entries.map(function(e, i){
+            var rank = getStat(e, ["rank"]);
+            return {
+              rank: rank != null ? rank : i + 1,
+              team: (e.team && (e.team.shortDisplayName || e.team.displayName || e.team.name)) || "Equipo",
+              points: getStat(e, ["points", "pts"]),
+              played: getStat(e, ["gamesplayed", "gp"]),
+              won: getStat(e, ["wins", "w"]),
+              drawn: getStat(e, ["ties", "draws", "d"]),
+              lost: getStat(e, ["losses", "l"]),
+              goalsFor: getStat(e, ["pointsfor", "goalsfor", "gf", "f"]),
+              goalsAgainst: getStat(e, ["pointsagainst", "goalsagainst", "ga", "a"]),
+              isUs: String(e.team && e.team.id) === TEAM_ID
+            };
+          });
+          mapped.sort(function(a, b){ return (a.rank || 0) - (b.rank || 0); });
+          return { group: group.name || "Zona", entries: mapped };
+        }
+      }
+      return null;
+    });
+  }
+
+  function lastOf(arr){ return arr.length ? arr[arr.length - 1] : null; }
+
+  function settle(promise, emptyValue){
+    return promise.then(
+      function(value){ return { ok: true, value: value }; },
+      function(){ return { ok: false, value: emptyValue }; }
+    );
+  }
+
+  function buildBody(byLeague, standings, ligaOk, argOk, libOk){
+    var allUpcoming = [].concat(byLeague.liga.upcoming, byLeague.argentina.upcoming, byLeague.libertadores.upcoming)
+      .sort(function(a, b){ return new Date(a.dateISO) - new Date(b.dateISO); });
+    var nextMatch = allUpcoming[0] || null;
+
+    var allCompleted = [].concat(byLeague.liga.completed, byLeague.argentina.completed, byLeague.libertadores.completed)
+      .sort(function(a, b){ return new Date(b.dateISO) - new Date(a.dateISO); });
+    var recentResults = allCompleted.slice(0, 6);
+
+    var ligaRank = standings ? standings.entries.filter(function(e){ return e.isUs; })[0] : null;
+
+    var competitions = [
+      {
+        key: "liga",
+        name: "Liga Profesional",
+        phase: ligaRank ? ("Clausura · " + standings.group + " · " + ligaRank.rank + "°") : "Clausura",
+        hasTable: true,
+        ok: ligaOk,
+        nextEvent: byLeague.liga.upcoming[0] || null,
+        lastResult: lastOf(byLeague.liga.completed)
+      },
+      {
+        key: "argentina",
+        name: "Copa Argentina",
+        phase: (byLeague.argentina.upcoming[0] && byLeague.argentina.upcoming[0].roundLabel) ||
+          (byLeague.argentina.completed.length || byLeague.argentina.upcoming.length ? "En curso" : "Sin datos"),
+        hasTable: false,
+        ok: argOk,
+        nextEvent: byLeague.argentina.upcoming[0] || null,
+        lastResult: lastOf(byLeague.argentina.completed)
+      },
+      {
+        key: "libertadores",
+        name: "Copa Libertadores",
+        phase: (byLeague.libertadores.upcoming[0] && byLeague.libertadores.upcoming[0].roundLabel) ||
+          (byLeague.libertadores.completed.length || byLeague.libertadores.upcoming.length ? "En curso" : "Sin datos"),
+        hasTable: false,
+        ok: libOk,
+        nextEvent: byLeague.libertadores.upcoming[0] || null,
+        lastResult: lastOf(byLeague.libertadores.completed)
+      }
+    ];
+
+    return {
+      updatedAt: new Date().toISOString(),
+      nextMatch: nextMatch,
+      competitions: competitions,
+      recentResults: recentResults,
+      standings: standings
+    };
+  }
+
+  function fetchLiveData(){
+    var emptyLeague = { completed: [], upcoming: [] };
+    return Promise.all([
+      settle(loadLeague(LEAGUES[0]), emptyLeague),
+      settle(loadLeague(LEAGUES[1]), emptyLeague),
+      settle(loadLeague(LEAGUES[2]), emptyLeague),
+      settle(loadStandings(), null)
+    ]).then(function(results){
+      var ligaR = results[0], argR = results[1], libR = results[2], standingsR = results[3];
+      var byLeague = { liga: ligaR.value, argentina: argR.value, libertadores: libR.value };
+      var standings = standingsR.value;
+      // If literally everything failed, treat this as a hard failure so the
+      // caller falls back to cached/error state instead of an all-empty page.
+      if (!ligaR.ok && !argR.ok && !libR.ok && !standingsR.ok){
+        throw new Error("all ESPN requests failed");
+      }
+      return buildBody(byLeague, standings, ligaR.ok, argR.ok, libR.ok);
+    });
+  }
 
   function fmtShortDate(iso){
     var d = new Date(iso);
@@ -919,8 +1121,7 @@
   }
 
   function load(){
-    fetch(API_URL, { cache: "no-store" })
-      .then(function(res){ if (!res.ok) throw new Error("bad status " + res.status); return res.json(); })
+    fetchLiveData()
       .then(function(data){
         try { localStorage.setItem(CACHE_KEY, JSON.stringify(data)); } catch(e){}
         renderAll(data);
