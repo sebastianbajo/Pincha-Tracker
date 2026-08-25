@@ -1,0 +1,15 @@
+{
+  "name": "Pincha Tracker — Estudiantes de La Plata",
+  "short_name": "Pincha Tracker",
+  "description": "Próximo partido, resultados y tabla de posiciones de Estudiantes de La Plata, en vivo.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#1c1613",
+  "theme_color": "#c4122f",
+  "orientation": "portrait",
+  "icons": [
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
