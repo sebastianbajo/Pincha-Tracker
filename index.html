@@ -679,6 +679,9 @@
   function standingsUrl(slug){
     return "https://site.api.espn.com/apis/v2/sports/soccer/" + slug + "/standings";
   }
+  function teamInfoUrl(slug){
+    return "https://site.api.espn.com/apis/site/v2/sports/soccer/" + slug + "/teams/" + TEAM_ID;
+  }
 
   function fetchEspnJson(url){
     return fetch(url, { mode: "cors", cache: "no-store" }).then(function(res){
@@ -738,9 +741,26 @@
   }
 
   function loadLeague(leagueMeta){
-    return fetchEspnJson(scheduleUrl(leagueMeta.slug)).then(function(data){
+    // The plain "schedule" endpoint is reliable for completed matches, but it
+    // often lags behind on the very next fixture (a cup round or a league
+    // date not "linked in" yet). The team-info endpoint's team.nextEvent is
+    // ESPN's more current source for "what's coming up", so we fetch both
+    // and merge — team-info failing quietly is fine, schedule failing is not.
+    var teamInfo = fetchEspnJson(teamInfoUrl(leagueMeta.slug)).catch(function(){ return null; });
+    return Promise.all([fetchEspnJson(scheduleUrl(leagueMeta.slug)), teamInfo]).then(function(results){
+      var data = results[0];
+      var teamData = results[1];
       var events = Array.isArray(data.events) ? data.events : [];
       var parsed = events.map(function(e){ return parseEvent(e, leagueMeta); }).filter(Boolean);
+
+      var extraNext = teamData && teamData.team && Array.isArray(teamData.team.nextEvent)
+        ? teamData.team.nextEvent.map(function(e){ return parseEvent(e, leagueMeta); }).filter(Boolean)
+        : [];
+      extraNext.forEach(function(ev){
+        var already = parsed.some(function(p){ return p.id === ev.id; });
+        if (!already) parsed.push(ev);
+      });
+
       parsed.sort(function(a, b){ return new Date(a.dateISO) - new Date(b.dateISO); });
       var completed = parsed.filter(function(e){ return e.completed; });
       var upcoming = parsed.filter(function(e){ return !e.completed; });
