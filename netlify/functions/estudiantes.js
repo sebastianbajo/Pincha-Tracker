@@ -106,4 +106,143 @@ function parseEvent(event, leagueMeta) {
     dateISO,
     completed,
     isHome,
-    opponent: (them.team &&
+    opponent: (them.team && (them.team.displayName || them.team.name)) || "Rival",
+    venue: (competition.venue && competition.venue.fullName) || null,
+    roundLabel,
+    scoreFor: us.score != null ? Number(us.score.value != null ? us.score.value : us.score) : null,
+    scoreAgainst: them.score != null ? Number(them.score.value != null ? them.score.value : them.score) : null,
+  };
+}
+
+async function loadLeague(leagueMeta) {
+  const data = await fetchJson(scheduleUrl(leagueMeta.slug));
+  const events = Array.isArray(data.events) ? data.events : [];
+  const parsed = events.map((e) => parseEvent(e, leagueMeta)).filter(Boolean);
+  parsed.sort((a, b) => new Date(a.dateISO) - new Date(b.dateISO));
+  const completed = parsed.filter((e) => e.completed);
+  const upcoming = parsed.filter((e) => !e.completed);
+  return { completed, upcoming };
+}
+
+async function loadStandings() {
+  const data = await fetchJson(standingsUrl(STANDINGS_LEAGUE_SLUG));
+  const groups = Array.isArray(data.children) ? data.children : [];
+  // Find the group (zone) that contains Estudiantes de La Plata.
+  for (const group of groups) {
+    const entries = (group.standings && group.standings.entries) || [];
+    const idx = entries.findIndex((e) => String(e.team && e.team.id) === TEAM_ID);
+    if (idx !== -1) {
+      const mapped = entries.map((e, i) => ({
+        rank: getStat(e, ["rank"]) ?? i + 1,
+        team: (e.team && (e.team.shortDisplayName || e.team.displayName || e.team.name)) || "Equipo",
+        points: getStat(e, ["points", "pts"]),
+        played: getStat(e, ["gamesplayed", "gp"]),
+        won: getStat(e, ["wins", "w"]),
+        drawn: getStat(e, ["ties", "draws", "d"]),
+        lost: getStat(e, ["losses", "l"]),
+        goalsFor: getStat(e, ["pointsfor", "goalsfor", "gf", "f"]),
+        goalsAgainst: getStat(e, ["pointsagainst", "goalsagainst", "ga", "a"]),
+        isUs: String(e.team && e.team.id) === TEAM_ID,
+      }));
+      mapped.sort((a, b) => (a.rank || 0) - (b.rank || 0));
+      return { group: group.name || "Zona", entries: mapped };
+    }
+  }
+  return null;
+}
+
+exports.handler = async function handler() {
+  const headers = {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "public, max-age=300", // 5 minutes edge cache
+    "Access-Control-Allow-Origin": "*",
+  };
+
+  const results = await Promise.allSettled([
+    loadLeague(LEAGUES[0]),
+    loadLeague(LEAGUES[1]),
+    loadLeague(LEAGUES[2]),
+    loadStandings(),
+  ]);
+
+  const [ligaR, argR, libR, standingsR] = results;
+
+  const byLeague = {
+    liga: ligaR.status === "fulfilled" ? ligaR.value : { completed: [], upcoming: [] },
+    argentina: argR.status === "fulfilled" ? argR.value : { completed: [], upcoming: [] },
+    libertadores: libR.status === "fulfilled" ? libR.value : { completed: [], upcoming: [] },
+  };
+  const standings = standingsR.status === "fulfilled" ? standingsR.value : null;
+
+  // Next match: earliest upcoming event across all three competitions.
+  const allUpcoming = []
+    .concat(byLeague.liga.upcoming, byLeague.argentina.upcoming, byLeague.libertadores.upcoming)
+    .sort((a, b) => new Date(a.dateISO) - new Date(b.dateISO));
+  const nextMatch = allUpcoming[0] || null;
+
+  // Recent results: last 5 completed events across all competitions, most recent first.
+  const allCompleted = []
+    .concat(byLeague.liga.completed, byLeague.argentina.completed, byLeague.libertadores.completed)
+    .sort((a, b) => new Date(b.dateISO) - new Date(a.dateISO));
+  const recentResults = allCompleted.slice(0, 6);
+
+  const ligaRank = standings ? standings.entries.find((e) => e.isUs) : null;
+
+  const lastOf = (arr) => (arr.length ? arr[arr.length - 1] : null);
+
+  const competitions = [
+    {
+      key: "liga",
+      name: "Liga Profesional",
+      phase: ligaRank ? `Clausura · ${standings.group} · ${ligaRank.rank}°` : "Clausura",
+      hasTable: true,
+      ok: ligaR.status === "fulfilled",
+      nextEvent: byLeague.liga.upcoming[0] || null,
+      lastResult: lastOf(byLeague.liga.completed),
+    },
+    {
+      key: "argentina",
+      name: "Copa Argentina",
+      phase:
+        (byLeague.argentina.upcoming[0] && byLeague.argentina.upcoming[0].roundLabel) ||
+        (byLeague.argentina.completed.length || byLeague.argentina.upcoming.length
+          ? "En curso"
+          : "Sin datos"),
+      hasTable: false,
+      ok: argR.status === "fulfilled",
+      nextEvent: byLeague.argentina.upcoming[0] || null,
+      lastResult: lastOf(byLeague.argentina.completed),
+    },
+    {
+      key: "libertadores",
+      name: "Copa Libertadores",
+      phase:
+        (byLeague.libertadores.upcoming[0] && byLeague.libertadores.upcoming[0].roundLabel) ||
+        (byLeague.libertadores.completed.length || byLeague.libertadores.upcoming.length
+          ? "En curso"
+          : "Sin datos"),
+      hasTable: false,
+      ok: libR.status === "fulfilled",
+      nextEvent: byLeague.libertadores.upcoming[0] || null,
+      lastResult: lastOf(byLeague.libertadores.completed),
+    },
+  ];
+
+  const body = {
+    updatedAt: new Date().toISOString(),
+    nextMatch,
+    competitions,
+    recentResults,
+    standings,
+    // surface partial-failure info (including the reason, for debugging) so
+    // the frontend can show a soft warning and we can diagnose issues live.
+    sourceStatus: {
+      liga: ligaR.status === "fulfilled" ? "fulfilled" : String(ligaR.reason && ligaR.reason.message),
+      argentina: argR.status === "fulfilled" ? "fulfilled" : String(argR.reason && argR.reason.message),
+      libertadores: libR.status === "fulfilled" ? "fulfilled" : String(libR.reason && libR.reason.message),
+      standings: standingsR.status === "fulfilled" ? "fulfilled" : String(standingsR.reason && standingsR.reason.message),
+    },
+  };
+
+  return { statusCode: 200, headers, body: JSON.stringify(body) };
+};
