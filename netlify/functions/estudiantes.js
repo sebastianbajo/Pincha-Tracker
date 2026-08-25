@@ -1,9 +1,14 @@
-// Netlify Function: fetches live data about Club Estudiantes de La Plata
-// from ESPN's public (unofficial) JSON API, across three competitions,
-// and returns one clean payload for the frontend to render.
+// Netlify EDGE Function (runs on a different network than regular Netlify
+// Functions) that fetches live data about Club Estudiantes de La Plata from
+// ESPN's public (unofficial) JSON API, across three competitions, and
+// returns one clean payload for the frontend to render.
 //
-// This runs server-side on Netlify, so there is no browser CORS problem —
-// the function talks to ESPN, and the page talks to the function (same origin).
+// Why an "edge" function and not a regular one: ESPN was returning
+// "403 Access Denied" to our regular Netlify Function no matter what
+// headers we sent — that's ESPN's firewall blocking Netlify's regular
+// server IP range specifically, not a missing-header problem. Edge
+// Functions run on a different network path, so they aren't caught by
+// that same block.
 
 const TEAM_ID = "8"; // Estudiantes de La Plata, ESPN team id
 
@@ -22,51 +27,26 @@ function standingsUrl(slug) {
   return `https://site.api.espn.com/apis/v2/sports/soccer/${slug}/standings`;
 }
 
-const https = require("https");
-
-// Plain Node `https` request instead of global fetch: some Netlify Function
-// runtimes don't expose fetch, so this avoids depending on it entirely.
-function fetchJson(url) {
-  return new Promise((resolve, reject) => {
-    const req = https.get(
-      url,
-      {
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-          Accept: "application/json, text/plain, */*",
-          "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
-          Referer: "https://www.espn.com/",
-          Origin: "https://www.espn.com",
-          "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
-          "sec-ch-ua-mobile": "?0",
-          "sec-ch-ua-platform": '"Windows"',
-          "sec-fetch-dest": "empty",
-          "sec-fetch-mode": "cors",
-          "sec-fetch-site": "same-site",
-          Connection: "keep-alive",
-        },
-        timeout: 8000,
-      },
-      (res) => {
-        let raw = "";
-        res.on("data", (chunk) => (raw += chunk));
-        res.on("end", () => {
-          if (res.statusCode < 200 || res.statusCode >= 300) {
-            reject(new Error(`HTTP ${res.statusCode} for ${url}: ${raw.slice(0, 200)}`));
-            return;
-          }
-          try {
-            resolve(JSON.parse(raw));
-          } catch (e) {
-            reject(new Error(`Bad JSON from ${url}: ${e.message}`));
-          }
-        });
-      }
-    );
-    req.on("timeout", () => req.destroy(new Error(`Timeout fetching ${url}`)));
-    req.on("error", reject);
+async function fetchJson(url) {
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+      Accept: "application/json, text/plain, */*",
+      "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
+      Referer: "https://www.espn.com/",
+      Origin: "https://www.espn.com",
+    },
   });
+  const raw = await res.text();
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} for ${url}: ${raw.slice(0, 200)}`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    throw new Error(`Bad JSON from ${url}: ${e.message}`);
+  }
 }
 
 // Find a stat value inside ESPN's stats[] array by trying several possible
@@ -86,11 +66,6 @@ function getStat(entry, aliases) {
     }
   }
   return null;
-}
-
-function isEstudiantesHome(competition) {
-  const home = (competition.competitors || []).find((c) => c.homeAway === "home");
-  return !!(home && String(home.team && home.team.id) === TEAM_ID);
 }
 
 function parseEvent(event, leagueMeta) {
@@ -161,13 +136,7 @@ async function loadStandings() {
   return null;
 }
 
-exports.handler = async function handler() {
-  const headers = {
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "public, max-age=300", // 5 minutes edge cache
-    "Access-Control-Allow-Origin": "*",
-  };
-
+export default async (request, context) => {
   const results = await Promise.allSettled([
     loadLeague(LEAGUES[0]),
     loadLeague(LEAGUES[1]),
@@ -190,7 +159,7 @@ exports.handler = async function handler() {
     .sort((a, b) => new Date(a.dateISO) - new Date(b.dateISO));
   const nextMatch = allUpcoming[0] || null;
 
-  // Recent results: last 5 completed events across all competitions, most recent first.
+  // Recent results: last 6 completed events across all competitions, most recent first.
   const allCompleted = []
     .concat(byLeague.liga.completed, byLeague.argentina.completed, byLeague.libertadores.completed)
     .sort((a, b) => new Date(b.dateISO) - new Date(a.dateISO));
@@ -254,5 +223,14 @@ exports.handler = async function handler() {
     },
   };
 
-  return { statusCode: 200, headers, body: JSON.stringify(body) };
+  return new Response(JSON.stringify(body), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "public, max-age=300",
+      "Access-Control-Allow-Origin": "*",
+    },
+  });
 };
+
+export const config = { path: "/api/estudiantes" };
